@@ -4,7 +4,7 @@
   "name": "译文问题审阅",
   "version": "1.0.0",
   "author": "WindyTranslator",
-  "description": "审阅译文回退记录和 Message 行宽问题，并直接保存到译文 JSON。",
+  "description": "审阅译文回退、Message 行宽，以及回忆台词和继续台词校准问题，并直接保存到译文 JSON。",
   "category": "gui",
   "runtime": "host_python",
   "entry": "review_app.py",

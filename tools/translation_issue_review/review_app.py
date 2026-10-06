@@ -39,6 +39,8 @@ STATUS_MODE_LABELS = {
     "problem": "回退+超限",
     "fallback": "仅回退",
     "overflow": "仅超限",
+    "recall": "回忆台词",
+    "continuation": "继续台词",
     "dirty": "已修改",
     "all": "全部已加载",
 }
@@ -79,7 +81,7 @@ ENTRY_TREE_HEADINGS = {
 }
 ENTRY_TREE_WIDTHS = {
     "map": 96,
-    "issue": 40,
+    "issue": 72,
     "marker": 60,
     "speaker": 60,
     "limit": 40,
@@ -348,6 +350,41 @@ def _truncate_preview(text: str, max_chars: int = 70) -> str:
     return preview[: max_chars - 3] + "..."
 
 
+# RPG Maker 2000/2003 message control codes that accept an optional `[n]`
+# parameter after the escape letter (EasyRPG PendingMessage::DefaultCommandInserter
+# handles n/N, v/V and t/T; Window_Message handles c/C and s/S).
+_ARG_CONTROL_CODES = frozenset("cCsSnNvVtT")
+
+
+def strip_control_codes(text: str) -> str:
+    """Remove RPG Maker 2000/2003 message control codes, following EasyRPG rules.
+
+    The escape character is the backslash. A backslash followed by any character
+    forms a control/escape code: letter codes in ``_ARG_CONTROL_CODES`` consume an
+    optional ``[n]`` parameter, and every other character consumes only the
+    backslash plus one character. Real line breaks (``0x0A``) are preserved as
+    content because they are line separators, not control codes.
+    """
+    if "\\" not in text:
+        return text
+
+    result: List[str] = []
+    index = 0
+    n = len(text)
+    while index < n:
+        char = text[index]
+        if char == "\\" and index + 1 < n:
+            code = text[index + 1]
+            index += 2
+            if code in _ARG_CONTROL_CODES and index < n and text[index] == "[":
+                close = text.find("]", index)
+                index = close + 1 if close != -1 else n
+            continue
+        result.append(char)
+        index += 1
+    return "".join(result)
+
+
 @dataclass
 class ReviewEntry:
     """In-memory review model for a translation entry that may need attention."""
@@ -365,6 +402,9 @@ class ReviewEntry:
     per_line_widths: List[int] = field(default_factory=list)
     overflow_lines: List[int] = field(default_factory=list)
     dirty: bool = False
+    sequence_index: int = 0
+    recall_group_id: Optional[int] = None
+    continuation_group_id: Optional[int] = None
 
     def __post_init__(self) -> None:
         self.recompute()
@@ -394,6 +434,14 @@ class ReviewEntry:
         return "fallback" in self.issue_kinds
 
     @property
+    def is_recall(self) -> bool:
+        return "recall" in self.issue_kinds
+
+    @property
+    def is_continuation(self) -> bool:
+        return "continuation" in self.issue_kinds
+
+    @property
     def key(self) -> Tuple[str, str]:
         return (self.map_name, self.original_key)
 
@@ -404,25 +452,26 @@ class ReviewEntry:
             labels.append("回退")
         if self.is_over_limit:
             labels.append("超限")
+        if self.is_recall:
+            labels.append("回忆")
+        if self.is_continuation:
+            labels.append("继续")
         return "+".join(labels) if labels else "候选"
 
     @property
     def status_label(self) -> str:
-        if self.is_fallback and self.is_over_limit and self.dirty:
-            return "已修改，回退，仍超限"
-        if self.is_fallback and self.dirty:
-            return "已修改，回退"
-        if self.is_fallback and self.is_over_limit:
-            return "回退，超限"
-        if self.is_fallback:
-            return "回退"
-        if self.is_over_limit and self.dirty:
-            return "已修改，仍超限"
-        if self.is_over_limit:
-            return "超限"
+        parts = []
         if self.dirty:
-            return "已修改"
-        return "正常"
+            parts.append("已修改")
+        if self.is_fallback:
+            parts.append("回退")
+        if self.is_over_limit:
+            parts.append("仍超限" if self.dirty else "超限")
+        if self.is_recall:
+            parts.append("回忆")
+        if self.is_continuation:
+            parts.append("继续")
+        return "，".join(parts) if parts else "正常"
 
     @property
     def summary(self) -> str:
@@ -595,6 +644,69 @@ def _fallback_record_map(records: Sequence[FallbackRecord]) -> Dict[Tuple[str, s
     return mapped
 
 
+def analyze_dialogue_consistency(entries: Sequence[ReviewEntry]) -> None:
+    """Tag recall (回忆台词) and continuation (继续台词) groups in place.
+
+    回忆台词: Message 块剥离控制码后内容完全相同, 但分散在不同地图或原始文本
+    因控制码不同而被视为多条条目。这里把所有同类条目编到同一个 recall_group_id。
+
+    继续台词: 同一地图内位置相邻的 Message 块, 剥离控制码后前者是后者的前缀。
+    一个"继续段"里所有条目共享同一个 continuation_group_id。
+    """
+    message_entries = [entry for entry in entries if entry.marker == MESSAGE_MARKER]
+
+    # Recall: group all Message entries by control-code-stripped original text.
+    by_stripped: Dict[str, List[ReviewEntry]] = {}
+    for entry in message_entries:
+        by_stripped.setdefault(strip_control_codes(entry.original_key), []).append(entry)
+
+    group_id = 0
+    for group in by_stripped.values():
+        if len(group) < 2:
+            continue
+        for entry in group:
+            entry.recall_group_id = group_id
+            entry.issue_kinds.append("recall")
+        group_id += 1
+
+    # Continuation: per-map runs of adjacent prefix-linked Message entries.
+    per_map: Dict[str, List[ReviewEntry]] = {}
+    for entry in message_entries:
+        per_map.setdefault(entry.map_name, []).append(entry)
+
+    chain_id = 0
+    for map_entries in per_map.values():
+        stripped = [strip_control_codes(entry.original_key) for entry in map_entries]
+        n = len(map_entries)
+        run_start = -1
+        i = 0
+        while i < n:
+            has_next = i + 1 < n
+            is_link = bool(
+                has_next
+                and stripped[i]
+                and stripped[i] != stripped[i + 1]
+                and stripped[i + 1].startswith(stripped[i])
+            )
+            if is_link:
+                if run_start == -1:
+                    run_start = i
+            elif run_start != -1:
+                for j in range(run_start, i + 1):
+                    entry = map_entries[j]
+                    entry.continuation_group_id = chain_id
+                    entry.issue_kinds.append("continuation")
+                chain_id += 1
+                run_start = -1
+            i += 1
+        if run_start != -1:
+            for j in range(run_start, n):
+                entry = map_entries[j]
+                entry.continuation_group_id = chain_id
+                entry.issue_kinds.append("continuation")
+            chain_id += 1
+
+
 def scan_translation_data(
     data: dict,
     fallback_records: Optional[Sequence[FallbackRecord]] = None,
@@ -633,9 +745,11 @@ def scan_translation_data(
                     marker=marker,
                     issue_kinds=issue_kinds,
                     fallback_reason=fallback_record.reason if fallback_record else None,
+                    sequence_index=len(review_entries),
                 )
             )
 
+    analyze_dialogue_consistency(review_entries)
     return review_entries
 
 
@@ -656,7 +770,10 @@ def translation_json_has_reviewable_issues(
         return True
     except Exception:
         return False
-    return any(entry.is_fallback or entry.is_over_limit for entry in entries)
+    return any(
+        entry.is_fallback or entry.is_over_limit or entry.is_recall or entry.is_continuation
+        for entry in entries
+    )
 
 
 def filter_entries(
@@ -680,6 +797,10 @@ def filter_entries(
             continue
         if status_mode == "overflow" and not entry.is_over_limit:
             continue
+        if status_mode == "recall" and not entry.is_recall:
+            continue
+        if status_mode == "continuation" and not entry.is_continuation:
+            continue
         if status_mode == "dirty" and not entry.dirty:
             continue
 
@@ -700,6 +821,23 @@ def filter_entries(
             if keyword_filter not in haystack:
                 continue
         visible.append(entry)
+
+    # Keep every copy of a recall group and every step of a continuation run in
+    # adjacent rows so the reviewer can compare their translations side by side.
+    if status_mode == "recall":
+        visible.sort(
+            key=lambda entry: (
+                entry.recall_group_id if entry.recall_group_id is not None else -1,
+                entry.sequence_index,
+            )
+        )
+    elif status_mode == "continuation":
+        visible.sort(
+            key=lambda entry: (
+                entry.continuation_group_id if entry.continuation_group_id is not None else -1,
+                entry.sequence_index,
+            )
+        )
     return visible
 
 
@@ -709,12 +847,16 @@ def summarize_entries(entries: Sequence[ReviewEntry]) -> dict:
     overflow_lines = sum(entry.overflow_count for entry in entries)
     dirty_entries = sum(1 for entry in entries if entry.dirty)
     fallback_entries = sum(1 for entry in entries if entry.is_fallback)
+    recall_entries = sum(1 for entry in entries if entry.is_recall)
+    continuation_entries = sum(1 for entry in entries if entry.is_continuation)
     return {
         "total_entries": len(entries),
         "overflow_entries": overflow_entries,
         "overflow_lines": overflow_lines,
         "dirty_entries": dirty_entries,
         "fallback_entries": fallback_entries,
+        "recall_entries": recall_entries,
+        "continuation_entries": continuation_entries,
     }
 
 
@@ -1535,7 +1677,9 @@ class LineLimitCheckerApp:
         self.status_var.set(
             f"已加载 {path.name}。候选条目 {stats['total_entries']} 条，"
             f"回退条目 {stats['fallback_entries']} 条，"
-            f"超限条目 {stats['overflow_entries']} 条，超限行 {stats['overflow_lines']} 行；{rules_note}。"
+            f"超限条目 {stats['overflow_entries']} 条，超限行 {stats['overflow_lines']} 行，"
+            f"回忆台词 {stats['recall_entries']} 条，继续台词 {stats['continuation_entries']} 条；"
+            f"{rules_note}。"
         )
 
     def _confirm_discard_unsaved_context(self) -> bool:
@@ -1611,7 +1755,8 @@ class LineLimitCheckerApp:
         self.list_stats_var.set(
             f"当前显示 {len(visible_entries)} / {all_stats['total_entries']} 条；"
             f"回退 {all_stats['fallback_entries']} 条，"
-            f"全部超限 {all_stats['overflow_entries']} 条，已修改 {all_stats['dirty_entries']} 条。"
+            f"超限 {all_stats['overflow_entries']} 条，已修改 {all_stats['dirty_entries']} 条，"
+            f"回忆 {all_stats['recall_entries']} 条，继续 {all_stats['continuation_entries']} 条。"
         )
 
         if not visible_entries:
