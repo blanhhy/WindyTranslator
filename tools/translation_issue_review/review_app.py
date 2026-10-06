@@ -780,6 +780,7 @@ def filter_entries(
     entries: Sequence[ReviewEntry],
     *,
     status_mode: str,
+    exclude_status: bool = False,
     map_filter: str = "",
     speaker_filter: str = "",
     keyword_filter: str = "",
@@ -791,17 +792,16 @@ def filter_entries(
 
     visible: List[ReviewEntry] = []
     for entry in entries:
-        if status_mode == "problem" and not (entry.is_fallback or entry.is_over_limit):
-            continue
-        if status_mode == "fallback" and not entry.is_fallback:
-            continue
-        if status_mode == "overflow" and not entry.is_over_limit:
-            continue
-        if status_mode == "recall" and not entry.is_recall:
-            continue
-        if status_mode == "continuation" and not entry.is_continuation:
-            continue
-        if status_mode == "dirty" and not entry.dirty:
+        status_matches = {
+            "problem": entry.is_fallback or entry.is_over_limit,
+            "fallback": entry.is_fallback,
+            "overflow": entry.is_over_limit,
+            "recall": entry.is_recall,
+            "continuation": entry.is_continuation,
+            "dirty": entry.dirty,
+            "all": True,
+        }.get(status_mode, False)
+        if status_matches == exclude_status:
             continue
 
         if map_filter and map_filter not in entry.map_name.lower():
@@ -1240,6 +1240,7 @@ class LineLimitCheckerApp:
         self.preview_var = tk.StringVar(value="尚未执行规则预览。")
 
         self.status_mode_var = tk.StringVar(value="problem" if integrated_mode else "overflow")
+        self.exclude_status_var = tk.BooleanVar(value=False)
         self.map_filter_var = tk.StringVar()
         self.speaker_filter_var = tk.StringVar()
         self.keyword_filter_var = tk.StringVar()
@@ -1374,9 +1375,14 @@ class LineLimitCheckerApp:
 
         action_row = ttk.Frame(filters)
         action_row.grid(row=4, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
-        ttk.Button(action_row, text="应用筛选", command=self._request_refresh_entry_list).pack(
+        ttk.Button(action_row, text="应用筛选", command=lambda: self._set_filter_exclusion(False)).pack(
             side=tk.RIGHT
         )
+        ttk.Button(
+            action_row,
+            text="排除筛选",
+            command=lambda: self._set_filter_exclusion(True),
+        ).pack(side=tk.RIGHT, padx=(0, 6))
         ttk.Button(action_row, text="清空", command=self._clear_filters).pack(
             side=tk.RIGHT, padx=(0, 6)
         )
@@ -1713,9 +1719,16 @@ class LineLimitCheckerApp:
         self.map_filter_var.set("")
         self.speaker_filter_var.set("")
         self.keyword_filter_var.set("")
+        self.exclude_status_var.set(False)
         default_mode = "problem" if self.integrated_mode else "overflow"
         self.status_mode_var.set(default_mode)
         self.status_combo.set(STATUS_MODE_LABELS[default_mode])
+        self._refresh_entry_list()
+
+    def _set_filter_exclusion(self, exclude: bool) -> None:
+        if not self._ensure_editor_changes_resolved(switching_entries=True):
+            return
+        self.exclude_status_var.set(exclude)
         self._refresh_entry_list()
 
     def _request_refresh_entry_list(self) -> None:
@@ -1727,6 +1740,7 @@ class LineLimitCheckerApp:
         visible_entries = filter_entries(
             self.entries,
             status_mode=self.status_mode_var.get(),
+            exclude_status=self.exclude_status_var.get(),
             map_filter=self.map_filter_var.get(),
             speaker_filter=self.speaker_filter_var.get(),
             keyword_filter=self.keyword_filter_var.get(),

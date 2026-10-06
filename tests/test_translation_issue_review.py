@@ -72,3 +72,18 @@ def test_scan_detects_adjacent_continuation_chain_and_ignores_choices():
     ]
     assert len({entry.continuation_group_id for entry in continuation_entries}) == 1
     assert all(entry.is_continuation for entry in continuation_entries)
+
+
+def test_filter_can_exclude_the_selected_status_category():
+    data = {
+        "MapA": {
+            "重复": _message("译文 1"),
+            r"\C[3]重复": _message("译文 2"),
+            "普通": _message("译文 3"),
+        }
+    }
+
+    entries = scan_translation_data(data)
+    excluded = filter_entries(entries, status_mode="recall", exclude_status=True)
+
+    assert [entry.original_key for entry in excluded] == ["普通"]
