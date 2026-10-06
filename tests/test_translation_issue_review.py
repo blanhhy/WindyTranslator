@@ -87,3 +87,39 @@ def test_filter_can_exclude_the_selected_status_category():
     excluded = filter_entries(entries, status_mode="recall", exclude_status=True)
 
     assert [entry.original_key for entry in excluded] == ["普通"]
+
+
+def test_filter_can_exclude_each_text_filter_independently():
+    data = {
+        "MapA": {
+            "甲": {**_message("译文 甲"), "speaker_id": "Alice"},
+            "乙": {**_message("译文 乙"), "speaker_id": "Bob"},
+        },
+        "MapB": {
+            "丙": {**_message("译文 丙"), "speaker_id": "Alice"},
+        },
+    }
+
+    entries = scan_translation_data(data)
+    excluded_map = filter_entries(
+        entries,
+        status_mode="all",
+        exclude_map=True,
+        map_filter="mapa",
+    )
+    excluded_speaker = filter_entries(
+        entries,
+        status_mode="all",
+        exclude_speaker=True,
+        speaker_filter="alice",
+    )
+    excluded_keyword = filter_entries(
+        entries,
+        status_mode="all",
+        exclude_keyword=True,
+        keyword_filter="甲",
+    )
+
+    assert [entry.original_key for entry in excluded_map] == ["丙"]
+    assert [entry.original_key for entry in excluded_speaker] == ["乙"]
+    assert [entry.original_key for entry in excluded_keyword] == ["乙", "丙"]

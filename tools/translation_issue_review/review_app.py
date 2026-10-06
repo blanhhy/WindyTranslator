@@ -781,6 +781,9 @@ def filter_entries(
     *,
     status_mode: str,
     exclude_status: bool = False,
+    exclude_map: bool = False,
+    exclude_speaker: bool = False,
+    exclude_keyword: bool = False,
     map_filter: str = "",
     speaker_filter: str = "",
     keyword_filter: str = "",
@@ -804,10 +807,12 @@ def filter_entries(
         if status_matches == exclude_status:
             continue
 
-        if map_filter and map_filter not in entry.map_name.lower():
+        map_matches = bool(map_filter and map_filter in entry.map_name.lower())
+        if map_filter and map_matches == exclude_map:
             continue
         speaker_text = (entry.speaker_id or "").lower()
-        if speaker_filter and speaker_filter not in speaker_text:
+        speaker_matches = bool(speaker_filter and speaker_filter in speaker_text)
+        if speaker_filter and speaker_matches == exclude_speaker:
             continue
         if keyword_filter:
             haystack = "\n".join(
@@ -818,7 +823,8 @@ def filter_entries(
                     entry.fallback_reason or "",
                 )
             ).lower()
-            if keyword_filter not in haystack:
+            keyword_matches = keyword_filter in haystack
+            if keyword_matches == exclude_keyword:
                 continue
         visible.append(entry)
 
@@ -1241,6 +1247,9 @@ class LineLimitCheckerApp:
 
         self.status_mode_var = tk.StringVar(value="problem" if integrated_mode else "overflow")
         self.exclude_status_var = tk.BooleanVar(value=False)
+        self.exclude_map_var = tk.BooleanVar(value=False)
+        self.exclude_speaker_var = tk.BooleanVar(value=False)
+        self.exclude_keyword_var = tk.BooleanVar(value=False)
         self.map_filter_var = tk.StringVar()
         self.speaker_filter_var = tk.StringVar()
         self.keyword_filter_var = tk.StringVar()
@@ -1346,7 +1355,7 @@ class LineLimitCheckerApp:
     def _build_left_panel(self, parent: ttk.Frame) -> None:
         filters = ttk.LabelFrame(parent, text="筛选")
         filters.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        for column in range(2):
+        for column in range(3):
             filters.columnconfigure(column, weight=1 if column == 1 else 0)
 
         ttk.Label(filters, text="视图").grid(row=0, column=0, sticky="w", padx=8, pady=6)
@@ -1357,6 +1366,9 @@ class LineLimitCheckerApp:
             width=16,
         )
         status_combo.grid(row=0, column=1, sticky="ew", padx=(0, 8), pady=6)
+        ttk.Checkbutton(filters, text="排除", variable=self.exclude_status_var).grid(
+            row=0, column=2, sticky="w", padx=(0, 8), pady=6
+        )
         status_combo.set(STATUS_MODE_LABELS[self.status_mode_var.get()])
         status_combo.bind("<<ComboboxSelected>>", self._on_status_mode_changed)
         self.status_combo = status_combo
@@ -1364,25 +1376,29 @@ class LineLimitCheckerApp:
         ttk.Label(filters, text="文件名").grid(row=1, column=0, sticky="w", padx=8, pady=6)
         map_entry = ttk.Entry(filters, textvariable=self.map_filter_var)
         map_entry.grid(row=1, column=1, sticky="ew", padx=(0, 8), pady=6)
+        ttk.Checkbutton(filters, text="排除", variable=self.exclude_map_var).grid(
+            row=1, column=2, sticky="w", padx=(0, 8), pady=6
+        )
 
         ttk.Label(filters, text="说话人").grid(row=2, column=0, sticky="w", padx=8, pady=6)
         speaker_entry = ttk.Entry(filters, textvariable=self.speaker_filter_var)
         speaker_entry.grid(row=2, column=1, sticky="ew", padx=(0, 8), pady=6)
+        ttk.Checkbutton(filters, text="排除", variable=self.exclude_speaker_var).grid(
+            row=2, column=2, sticky="w", padx=(0, 8), pady=6
+        )
 
         ttk.Label(filters, text="关键词").grid(row=3, column=0, sticky="w", padx=8, pady=6)
         keyword_entry = ttk.Entry(filters, textvariable=self.keyword_filter_var)
         keyword_entry.grid(row=3, column=1, sticky="ew", padx=(0, 8), pady=6)
+        ttk.Checkbutton(filters, text="排除", variable=self.exclude_keyword_var).grid(
+            row=3, column=2, sticky="w", padx=(0, 8), pady=6
+        )
 
         action_row = ttk.Frame(filters)
-        action_row.grid(row=4, column=0, columnspan=2, sticky="ew", padx=8, pady=(0, 8))
-        ttk.Button(action_row, text="应用筛选", command=lambda: self._set_filter_exclusion(False)).pack(
+        action_row.grid(row=4, column=0, columnspan=3, sticky="ew", padx=8, pady=(0, 8))
+        ttk.Button(action_row, text="应用筛选", command=self._request_refresh_entry_list).pack(
             side=tk.RIGHT
         )
-        ttk.Button(
-            action_row,
-            text="排除筛选",
-            command=lambda: self._set_filter_exclusion(True),
-        ).pack(side=tk.RIGHT, padx=(0, 6))
         ttk.Button(action_row, text="清空", command=self._clear_filters).pack(
             side=tk.RIGHT, padx=(0, 6)
         )
@@ -1704,7 +1720,6 @@ class LineLimitCheckerApp:
             if label == mode_label:
                 self.status_mode_var.set(mode)
                 break
-        self._request_refresh_entry_list()
 
     def _on_rule_scope_changed(self, _event: tk.Event) -> None:
         label = self.rule_scope_combo.get()
@@ -1720,15 +1735,12 @@ class LineLimitCheckerApp:
         self.speaker_filter_var.set("")
         self.keyword_filter_var.set("")
         self.exclude_status_var.set(False)
+        self.exclude_map_var.set(False)
+        self.exclude_speaker_var.set(False)
+        self.exclude_keyword_var.set(False)
         default_mode = "problem" if self.integrated_mode else "overflow"
         self.status_mode_var.set(default_mode)
         self.status_combo.set(STATUS_MODE_LABELS[default_mode])
-        self._refresh_entry_list()
-
-    def _set_filter_exclusion(self, exclude: bool) -> None:
-        if not self._ensure_editor_changes_resolved(switching_entries=True):
-            return
-        self.exclude_status_var.set(exclude)
         self._refresh_entry_list()
 
     def _request_refresh_entry_list(self) -> None:
@@ -1741,6 +1753,9 @@ class LineLimitCheckerApp:
             self.entries,
             status_mode=self.status_mode_var.get(),
             exclude_status=self.exclude_status_var.get(),
+            exclude_map=self.exclude_map_var.get(),
+            exclude_speaker=self.exclude_speaker_var.get(),
+            exclude_keyword=self.exclude_keyword_var.get(),
             map_filter=self.map_filter_var.get(),
             speaker_filter=self.speaker_filter_var.get(),
             keyword_filter=self.keyword_filter_var.get(),
