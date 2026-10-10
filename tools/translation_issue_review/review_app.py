@@ -41,6 +41,7 @@ STATUS_MODE_LABELS = {
     "overflow": "仅超限",
     "recall": "回忆台词",
     "continuation": "继续台词",
+    "inconsistent": "不统一",
     "dirty": "已修改",
     "all": "全部已加载",
 }
@@ -402,6 +403,7 @@ class ReviewEntry:
     per_line_widths: List[int] = field(default_factory=list)
     overflow_lines: List[int] = field(default_factory=list)
     dirty: bool = False
+    inconsistent: bool = False
     sequence_index: int = 0
     recall_group_id: Optional[int] = None
     continuation_group_id: Optional[int] = None
@@ -442,6 +444,10 @@ class ReviewEntry:
         return "continuation" in self.issue_kinds
 
     @property
+    def is_inconsistent(self) -> bool:
+        return self.inconsistent
+
+    @property
     def key(self) -> Tuple[str, str]:
         return (self.map_name, self.original_key)
 
@@ -463,6 +469,8 @@ class ReviewEntry:
         parts = []
         if self.dirty:
             parts.append("已修改")
+        if self.is_inconsistent:
+            parts.append("不统一")
         if self.is_fallback:
             parts.append("回退")
         if self.is_over_limit:
@@ -706,6 +714,38 @@ def analyze_dialogue_consistency(entries: Sequence[ReviewEntry]) -> None:
                 entry.issue_kinds.append("continuation")
             chain_id += 1
 
+    update_translation_consistency(entries)
+
+
+def update_translation_consistency(entries: Sequence[ReviewEntry]) -> None:
+    """Mark entries whose control-code-stripped translations disagree."""
+    for entry in entries:
+        entry.inconsistent = False
+
+    recall_groups: Dict[int, List[ReviewEntry]] = {}
+    continuation_groups: Dict[int, List[ReviewEntry]] = {}
+    for entry in entries:
+        if entry.recall_group_id is not None:
+            recall_groups.setdefault(entry.recall_group_id, []).append(entry)
+        if entry.continuation_group_id is not None:
+            continuation_groups.setdefault(entry.continuation_group_id, []).append(entry)
+
+    for group in recall_groups.values():
+        if len({strip_control_codes(entry.current_text) for entry in group}) <= 1:
+            continue
+        for entry in group:
+            entry.inconsistent = True
+
+    for group in continuation_groups.values():
+        ordered = sorted(group, key=lambda entry: entry.sequence_index)
+        for previous, following in zip(ordered, ordered[1:]):
+            previous_text = strip_control_codes(previous.current_text)
+            following_text = strip_control_codes(following.current_text)
+            if following_text.startswith(previous_text):
+                continue
+            previous.inconsistent = True
+            following.inconsistent = True
+
 
 def scan_translation_data(
     data: dict,
@@ -771,7 +811,9 @@ def translation_json_has_reviewable_issues(
     except Exception:
         return False
     return any(
-        entry.is_fallback or entry.is_over_limit or entry.is_recall or entry.is_continuation
+        entry.is_fallback
+        or entry.is_over_limit
+        or entry.is_inconsistent
         for entry in entries
     )
 
@@ -801,6 +843,7 @@ def filter_entries(
             "overflow": entry.is_over_limit,
             "recall": entry.is_recall,
             "continuation": entry.is_continuation,
+            "inconsistent": entry.is_inconsistent,
             "dirty": entry.dirty,
             "all": True,
         }.get(status_mode, False)
@@ -855,6 +898,7 @@ def summarize_entries(entries: Sequence[ReviewEntry]) -> dict:
     fallback_entries = sum(1 for entry in entries if entry.is_fallback)
     recall_entries = sum(1 for entry in entries if entry.is_recall)
     continuation_entries = sum(1 for entry in entries if entry.is_continuation)
+    inconsistent_entries = sum(1 for entry in entries if entry.is_inconsistent)
     return {
         "total_entries": len(entries),
         "overflow_entries": overflow_entries,
@@ -863,6 +907,7 @@ def summarize_entries(entries: Sequence[ReviewEntry]) -> dict:
         "fallback_entries": fallback_entries,
         "recall_entries": recall_entries,
         "continuation_entries": continuation_entries,
+        "inconsistent_entries": inconsistent_entries,
     }
 
 
@@ -1701,6 +1746,7 @@ class LineLimitCheckerApp:
             f"回退条目 {stats['fallback_entries']} 条，"
             f"超限条目 {stats['overflow_entries']} 条，超限行 {stats['overflow_lines']} 行，"
             f"回忆台词 {stats['recall_entries']} 条，继续台词 {stats['continuation_entries']} 条；"
+            f"不统一 {stats['inconsistent_entries']} 条；"
             f"{rules_note}。"
         )
 
@@ -1786,6 +1832,7 @@ class LineLimitCheckerApp:
             f"回退 {all_stats['fallback_entries']} 条，"
             f"超限 {all_stats['overflow_entries']} 条，已修改 {all_stats['dirty_entries']} 条，"
             f"回忆 {all_stats['recall_entries']} 条，继续 {all_stats['continuation_entries']} 条。"
+            f"不统一 {all_stats['inconsistent_entries']} 条。"
         )
 
         if not visible_entries:
@@ -1962,6 +2009,7 @@ class LineLimitCheckerApp:
 
         new_text = self._get_editor_text()
         entry.update_text(new_text)
+        update_translation_consistency(self.entries)
         self._refresh_current_entry_metrics(editor_text=entry.current_text)
 
         current_visible_index = (
@@ -1989,6 +2037,7 @@ class LineLimitCheckerApp:
         ):
             return
         entry.restore_initial()
+        update_translation_consistency(self.entries)
         self.loading_editor = True
         self.translation_text.delete("1.0", tk.END)
         self.translation_text.insert("1.0", entry.current_text)
@@ -2209,6 +2258,7 @@ class LineLimitCheckerApp:
             return
 
         current_id = self.current_entry_id
+        update_translation_consistency(self.entries)
         self._refresh_entry_list(select_entry_id=current_id)
         if self.current_entry_id:
             current_entry = self.entries_by_id[self.current_entry_id]

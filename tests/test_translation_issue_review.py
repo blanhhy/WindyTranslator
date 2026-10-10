@@ -2,6 +2,7 @@ from tools.translation_issue_review.review_app import (
     filter_entries,
     scan_translation_data,
     strip_control_codes,
+    update_translation_consistency,
 )
 
 
@@ -123,3 +124,50 @@ def test_filter_can_exclude_each_text_filter_independently():
     assert [entry.original_key for entry in excluded_map] == ["丙"]
     assert [entry.original_key for entry in excluded_speaker] == ["乙"]
     assert [entry.original_key for entry in excluded_keyword] == ["乙", "丙"]
+
+
+def test_recall_translation_mismatch_marks_the_whole_group_only_in_status():
+    data = {
+        "MapA": {"重复": _message("相同")},
+        "MapB": {r"\C[3]重复": _message("不同")},
+    }
+
+    entries = scan_translation_data(data)
+
+    assert all(entry.is_inconsistent for entry in entries)
+    assert all("不统一" in entry.status_label for entry in entries)
+    assert all("不统一" not in entry.issue_label for entry in entries)
+    assert filter_entries(entries, status_mode="inconsistent") == entries
+
+
+def test_translation_control_code_differences_are_ignored_for_consistency():
+    data = {
+        "MapA": {
+            "重复": _message(r"\C[1]同一句"),
+            r"\S[2]重复": _message(r"\V[3]同一句"),
+        }
+    }
+
+    entries = scan_translation_data(data)
+
+    assert all(not entry.is_inconsistent for entry in entries)
+
+
+def test_continuation_translation_mismatch_marks_only_the_broken_pair():
+    data = {
+        "MapA": {
+            "甲": _message("a"),
+            "甲乙": _message("x"),
+            "甲乙丙": _message("xy"),
+        }
+    }
+
+    entries = scan_translation_data(data)
+
+    assert [entry.is_inconsistent for entry in entries] == [True, True, False]
+
+    entries[1].update_text("a")
+    entries[2].update_text("ab")
+    update_translation_consistency(entries)
+
+    assert [entry.is_inconsistent for entry in entries] == [False, False, False]
