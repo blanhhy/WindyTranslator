@@ -2,6 +2,7 @@
   "manifest_version": 1,
   "id": "translation_issue_review",
   "name": "译文问题审阅",
+  "pro_shortcut": {"short_name": "问题审阅"},
   "version": "1.0.0",
   "author": "WindyTranslator",
   "description": "审阅译文回退、Message 行宽，以及回忆台词和继续台词校准问题，并直接保存到译文 JSON。",
