@@ -6,7 +6,7 @@ import re
 import time
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed # 使用 as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED, CancelledError
 from core.api_clients import deepseek
 from core.utils import file_system, text_processing, default_database, control_tokens
 from core.utils.engine_detection import detect_game_engine
@@ -216,6 +216,17 @@ def _discard_translation_cache_if_dictionaries_changed(translated_json_path, dic
 
 
 # --- 主任务函数 ---
+def _completed_futures(futures, stop_event):
+    pending = set(futures)
+    while pending:
+        if stop_event.is_set():
+            for future in pending:
+                future.cancel()
+        finished, _ = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+        pending.difference_update(finished)
+        yield from finished
+
+
 def run_translate(game_path, works_dir, translate_config, world_dict_config, message_queue):
     start_time = time.time()
     character_dictionary = [] 
@@ -344,8 +355,6 @@ def run_translate(game_path, works_dir, translate_config, world_dict_config, mes
 
         # --- 获取翻译配置 ---
         current_translate_config = translate_config.copy()
-        apply_gbk_compatibility = not detected_game or detected_game.engine == "rm200x"
-        current_translate_config["_apply_gbk_compatibility_postprocess"] = apply_gbk_compatibility
         control_profile = control_tokens.profile_from_game(game_path)
         current_translate_config["_control_code_profile"] = control_profile
         if detected_game and detected_game.engine == "wolf":
@@ -368,10 +377,6 @@ def run_translate(game_path, works_dir, translate_config, world_dict_config, mes
                 key=len,
                 reverse=True,
             ))
-        if detected_game and not apply_gbk_compatibility:
-            message_queue.put(("log", ("normal", f"检测到 {detected_game.engine}：跳过 RM2000/2003 的 GBK 字符兼容化后处理。")))
-        else:
-            message_queue.put(("log", ("normal", "启用 RM2000/2003 的 GBK 字符兼容化后处理。")))
         message_queue.put(("log", ("normal", f"控制码保护配置: {control_profile.summary}")))
         api_url = current_translate_config.get("api_url", "").strip()
         api_key = current_translate_config.get("api_key", "").strip()
@@ -554,7 +559,8 @@ def run_translate(game_path, works_dir, translate_config, world_dict_config, mes
         processed_items_count = 0   # 仅统计需要翻译的条目数（不含预填）
 
         session = TranslationSession(
-            current_translate_config, os.path.join(translated_dir, "translation_requests.jsonl")
+            current_translate_config, os.path.join(translated_dir, "translation_requests.jsonl"),
+            stop_event=getattr(message_queue, "stop_event", None),
         )
         current_translate_config["_translation_session"] = session
         checkpoint_lock = threading.Lock()
@@ -602,7 +608,7 @@ def run_translate(game_path, works_dir, translate_config, world_dict_config, mes
             last_status_update_time = time.time()
             status_update_interval_sec = 0.5
 
-            for future in as_completed(future_to_task_info):
+            for future in _completed_futures(future_to_task_info, session.stop):
                 task_info_for_this_future = future_to_task_info[future]
                 source_file_of_this_batch = task_info_for_this_future["source_file"]
                 num_items_in_this_batch = len(task_info_for_this_future["batch_items"])
@@ -612,7 +618,7 @@ def run_translate(game_path, works_dir, translate_config, world_dict_config, mes
                     processed_file_name, batch_result_dict_from_worker = future.result()
                     
                     checkpoint(processed_file_name, batch_result_dict_from_worker)
-                except TranslationPaused:
+                except (TranslationPaused, CancelledError):
                     # Successful records have already been checkpointed by the worker.
                     continue
                 except Exception as exc:

@@ -1,9 +1,11 @@
 # core/tasks/import_task.py
 import os
 import logging
+import shutil
+import tempfile
 from pathlib import Path
 from core.external import easyrpg, rpgrewriter
-from core.utils import rpg_rt_ini
+from core.utils import rpg_rt_ini, text_processing
 from core.utils.engine_detection import detect_game_engine
 
 log = logging.getLogger(__name__)
@@ -16,15 +18,72 @@ def _read_title_file(path):
     return lines[1]
 
 
-def run_import(game_path, source_encoding, import_encoding, message_queue):
+def _import_game_data(game_path, source_encoding, target_encoding, message_queue, output_mode):
+    lmt_path = Path(game_path) / "RPG_RT.lmt"
+    legacy = output_mode == "legacy"
+    transcode = str(source_encoding) != str(target_encoding)
+    from core.tasks.json_creation import _extract_strings_from_file
+    from core.tasks.json_release import _apply_translations_to_file
+
+    scripts_path = Path(game_path) / "StringScripts"
+    replacements = {}
+    for path in (scripts_path.rglob("*.txt") if legacy else ()):
+        changes = {}
+        for original in _extract_strings_from_file(str(path)):
+            compatible = text_processing.apply_gbk_compatibility(original)
+            if compatible != original:
+                changes[original] = {"text": compatible}
+        if changes:
+            replacements[path.relative_to(scripts_path)] = changes
+
+    # 底层工具固定读取 LMT 同目录的 StringScripts；在副本中执行，
+    # 不临时搬走用户的脚本目录，也不将兼容化文本写回原 TXT/JSON。
+    with tempfile.TemporaryDirectory(prefix=".windy-import-", dir=game_path) as temporary_dir:
+        staging_path = Path(temporary_dir)
+        originals = {
+            path: path.read_bytes()
+            for path in Path(game_path).iterdir()
+            if path.is_file() and path.suffix.lower() in {".lmt", ".ldb", ".lmu"}
+        }
+        for path, content in originals.items():
+            (staging_path / path.name).write_bytes(content)
+        for filename in ("input.txt", "UserSettings.txt"):
+            sidecar = Path(game_path) / filename
+            if sidecar.is_file():
+                shutil.copy2(sidecar, staging_path / sidecar.name)
+        staged_scripts = staging_path / "StringScripts"
+        shutil.copytree(scripts_path, staged_scripts)
+        for relative_path, changes in replacements.items():
+            _apply_translations_to_file(str(staged_scripts / relative_path), changes)
+
+        staged_lmt = str(staging_path / lmt_path.name)
+        if transcode:
+            message_queue.put(("log", ("normal", f"统一转换游戏数据编码：{source_encoding} → {target_encoding}（临时副本）。")))
+            converted = rpgrewriter.transcode_game_data(staged_lmt, source_encoding, target_encoding)
+            if converted[0] != 0:
+                return converted
+        read_encoding = target_encoding if transcode else source_encoding
+        result = rpgrewriter.import_text_command(staged_lmt, read_encoding, target_encoding)
+        if result[0] == 0:
+            if any(path.read_bytes() != content for path, content in originals.items()):
+                raise RuntimeError("导入期间游戏数据被其他程序修改，已停止写回临时导入结果。")
+            for path, original_content in originals.items():
+                staged_file = staging_path / path.name
+                if staged_file.read_bytes() != original_content:
+                    os.replace(staged_file, path)
+        return result
+
+
+def run_import(game_path, source_encoding, target_encoding, message_queue, output_mode):
     """
     执行将 StringScripts 文本导入回游戏文件的流程。
 
     Args:
         game_path (str): 游戏根目录路径。
         source_encoding (str): 原始游戏编码选择（如 "auto" 或 "932"）。
-        import_encoding (str): 导入时使用的写入编码代号 (如 "936")。
+        target_encoding (str): 导入时使用的目标编码代号 (如 "936")。
         message_queue (queue.Queue): 用于向主线程发送消息的队列。
+        output_mode (str): 输出方式，传统兼容模式在临时副本中替换不支持的符号。
     """
     ini_temp_path = None
     try:
@@ -80,8 +139,8 @@ def run_import(game_path, source_encoding, import_encoding, message_queue):
             return
 
         source_encoding = easyrpg.resolve_game_encoding(game_path, source_encoding)
-        message_queue.put(("status", f"正在导入文本 (编码: {import_encoding})..."))
-        message_queue.put(("log", ("normal", f"步骤 7: 开始导入文本 (写入编码: {import_encoding})...")))
+        message_queue.put(("status", f"正在导入文本 (编码: {target_encoding})..."))
+        message_queue.put(("log", ("normal", f"步骤 7: 开始导入文本 (写入编码: {target_encoding})...")))
 
         lmt_path = os.path.join(game_path, "RPG_RT.lmt")
         string_scripts_path = os.path.join(game_path, "StringScripts")
@@ -102,17 +161,25 @@ def run_import(game_path, source_encoding, import_encoding, message_queue):
 
         if ini_path.exists():
             translated_title = _read_title_file(title_path) if title_path.exists() else None
-            ini_text, _ini_encoding = rpg_rt_ini.read_ini(ini_path, source_encoding)
+            ini_text, ini_encoding = rpg_rt_ini.read_ini(ini_path, source_encoding)
+            log.info(
+                "读取 RPG_RT.ini：文件编码=%s，游戏数据编码=%s，写入编码=%s",
+                ini_encoding, source_encoding, target_encoding,
+            )
+            if translated_title is None:
+                translated_title = rpg_rt_ini.get_game_title(ini_text)
+            if translated_title is not None and output_mode == "legacy":
+                translated_title = text_processing.apply_gbk_compatibility(translated_title)
             if translated_title is not None:
                 ini_text = rpg_rt_ini.set_game_title(ini_text, translated_title)
             ini_text = rpg_rt_ini.set_full_package_flag(ini_text)
-            ini_text = rpg_rt_ini.set_easy_rpg_encoding(ini_text, import_encoding)
-            ini_bytes = rpg_rt_ini.encode_ini(ini_text, import_encoding)
+            ini_text = rpg_rt_ini.set_easy_rpg_encoding(ini_text, target_encoding)
+            ini_bytes = rpg_rt_ini.encode_ini(ini_text, target_encoding)
             ini_temp_path = ini_path.with_name(f"{ini_path.name}.import.tmp")
             ini_temp_path.write_bytes(ini_bytes)
 
         # 执行导入命令
-        return_code, stdout, stderr = rpgrewriter.import_text_command(lmt_path, import_encoding)
+        return_code, stdout, stderr = _import_game_data(game_path, source_encoding, target_encoding, message_queue, output_mode)
 
         if return_code == 0:
             if ini_temp_path is not None:
@@ -122,6 +189,7 @@ def run_import(game_path, source_encoding, import_encoding, message_queue):
             message_queue.put(("success", "文本已从 StringScripts 文件夹导入到游戏中。"))
             message_queue.put(("status", "文本导入完成"))
             message_queue.put(("done", None))
+            return True
         else:
             if ini_temp_path is not None:
                 ini_temp_path.unlink(missing_ok=True)
