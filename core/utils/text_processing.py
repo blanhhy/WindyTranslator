@@ -239,7 +239,7 @@ def apply_gbk_compatibility(text):
     if not isinstance(text, str):
         return text
     for original, replacement in (
-        ('・', '·'), ('ー', '―'), ('—', '―'), ('♪', '～'), ('~', '～'),
+        ('・', '·'), ('ー', '―'), ('♪', '～'), ('~', '～'),
         ('⋯', '…'), ('≫', '》'), ('≪', '《'), ('⇒', '→'),
     ):
         text = text.replace(original, replacement)
